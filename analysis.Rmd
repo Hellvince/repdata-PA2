@@ -1,0 +1,191 @@
+---
+title: "Health and economic impacts of weather events in the USA : an analysis using the NOAA Storm Database"
+author: "Vincent CANUEL"
+date: "Saturday, August 23, 2014"
+output: html_document
+---
+## Synopsis
+
+Storms and other severe weather events can cause both public health and economic problems for communities and municipalities. This project involves exploring the U.S. National Oceanic and Atmospheric Administration's (NOAA) storm database. This database tracks characteristics of major storms and weather events in the United States, including when and where they occur, as well as estimates of any fatalities, injuries, and property damage.
+
+To explore the population health and economic impacts of weather events in USA, we first load the NOAA database and lighly clean it (mainly variable selection and variable format tuning). We then proceed to clean the `EVTYPE` variable (type of weather events) with a  manually created lookup table, and divide the clean dataset in two (one for each analysis axis : population health and economic). Main outcomes (total casualities and total damages) are then calculated in each subset, across the whole study period. The 10 events with worst ouctomes regarding population health and economic consequences, respectively, are shown. Somes of the main issues regarding this analysis are discussed in the last section.
+
+## Data processing
+
+Multiples R packages are required to perform this analysis. We need to load them before going farther :
+```{r echo=T, message=FALSE, warning=FALSE}
+library(lubridate)
+library(stringr)
+library(ggplot2)
+library(plyr)
+library(scales)
+```
+
+### Initial loading/cleaning
+
+We first read the original dataset (a CSV file, compressed with BZ2) and load it.
+```{r, cache=T}
+# Creates a connection to the dataset, read its content and closes the connection
+con <- bzfile("./data/repdata-data-StormData.csv.bz2", "rt")
+stormdb <- read.csv(con)
+close(con)
+```
+
+This **dataset is quite big** : `stormdb` is made of `r nrow(stormdb)` observations and `r ncol(stormdb)` variables. We may want to drop some variables, not required for the present analysis, to ease further computation.
+
+We want to analyze the population health impact of weather events. After carefully reading the accompanying PDF, it seems that only two variables in the NOAA dataset report on some **health-related outcomes** : `FATALITIES` (number of fatalities) and `INJURIES` (number of injuries). Four other variables report on **economic-related outcomes** : `PROPDMG` for property damages and `CROPDMG` for crop damages, with the accompanying magnitudes variables `PROPDMGEXP` and `CROPDMGEXP`
+
+Hence, the following variables are selected for further analysis :
+
+* `EVTYPE` 
+* `BGN_DATE`
+* `FATALITIES` and `INJURIES`
+* `PROPDMG` and `CROPDMG`
+
+The `BGN_DATE` is cleaned to be easily usable in R, and the year of the event is extracted. The magnitudes variables are also harmonized.
+```{r echo=TRUE, cache=TRUE}
+# Keep only the required variables
+colIndex <- c("EVTYPE","BGN_DATE", "FATALITIES", "INJURIES", "PROPDMG", "PROPDMGEXP", "CROPDMG", "CROPDMGEXP")
+stormdb <- stormdb[,colIndex]
+
+# Modify the date format and extract the year
+stormdb$BGN_DATE <- mdy_hms(stormdb$BGN_DATE)
+stormdb$YEAR <- year(stormdb$BGN_DATE)
+
+# Harmonize the magnitudes variables
+stormdb$PROPDMGEXP <- toupper(stormdb$PROPDMGEXP)
+stormdb$CROPDMGEXP <- toupper(stormdb$CROPDMGEXP)
+```
+
+
+### Cleaning the EVTYPE variable
+
+According to "2.1 Permitted Storm Data Events" section in the accompanying PDF, **only 48 distinct events are supposed to be registered in the database**. The `EVTYPE` variable should therefore have only 48 distinct values.  
+However, it's not exactly the case in the provided NOAA database :
+```{r}
+length(unique(stormdb$EVTYPE))
+```
+
+We have **`r length(unique(stormdb$EVTYPE))` distinct values for the `EVTYPE` variable !** As `EVTYPE` is crucial for our downstream analysis, we have to clean this variable a little bit...
+
+First, we can harmonize existing values by trimming trailing and leading blank spaces (using `str_trim()` from the `stringr` package), and by converting strings to upper-case (using `toupper()`). We can also eliminate observations with obvious wrong `EVTYPE` values, such as the ones beginning by "summary", by using `grepl()`.
+
+```{r echo=TRUE, cache=TRUE}
+# Harmonizing values
+stormdb$EVTYPE <- toupper(str_trim(stormdb$EVTYPE))
+
+# Finding observations with EVTYPE values like "summary ..." and eliminating them
+elim <- !(grepl("SUMMARY", stormdb$EVTYPE))
+stormdb <- stormdb[elim==T,]
+
+# Number of distinct values remaining 
+length(unique(stormdb$EVTYPE))
+```
+
+We still have `r length(unique(stormdb$EVTYPE))` remaining `EVTYPE` values. For these remaining values, **we match them manually against the permitted values**. As suggested by the accompanying PDF, we replace the existing event names with the one permitted that most accurately describe the meteorological event. **If it's not possible, we relabel these events as "OTHER"**. 
+
+As a consequence, **a lookup table is manually generated**. This lookup table is provided on [GitHub](https://github.com/Hellvince/repdata-PA2) as a CSV file (*lookuptable.csv*). In this file, for each "original" event name in the `originalType` variable, we provide a "modified" event name in the `modifiedType` variable). These new event names are then merged with our dataset.
+
+As **"OTHER" events are not suitable for futher analysis** (it encompasses many different event types supposedly not tracked by this database), we can exlude observations with this type of event.
+
+```{r echo=TRUE, cache=TRUE}
+# Load the lookup table
+lookup <- read.csv2("lookuptable.csv", stringsAsFactor=F)
+
+# Add our modified list of event names to the dataset
+stormdb <- merge(stormdb, lookup, by.x="EVTYPE", by.y="originalType")
+
+# We eliminate "OTHER"" events that couldn't be matched with one of the official event type
+stormdb <- stormdb[stormdb$modifiedType != "OTHER",]
+
+# The modifiedType variable is cast as a factor to ease further data manipulation
+stormdb$modifiedType <- as.factor(stormdb$modifiedType)
+``` 
+
+### Preparing analysis
+
+Health-related and economic-related outcomes of weather events are two distinct analysis. We can **part the dataset in two** to facilitate further analyses :
+* an `health` dataset for health-related outcomes analysis : we select only observations with some fatalities or injuries.
+* an `economic` dataset for economic-related outcomes analysis : we select only observations with some property or crop damages. We also need to **select observations where the damage coefficient (`PROPDMGECXP` and`CROPDMGEXP`) are valid** (either B,M or K)
+
+```{r echo=TRUE}
+# Observations with valid health-related outcomes
+health <- stormdb[stormdb$FATALITIES>0 | stormdb$INJURIES>0,] 
+
+# Observations with valid economic-related ouctomes
+coeff <- c("B","M","K")
+economic <- stormdb[(stormdb$PROPDMG>0 | stormdb$CROPDMG>0) & stormdb$CROPDMGEXP %in% coeff & stormdb$PROPDMGEXP %in% coeff, ]
+
+# Update properties damages with the amount * coeff
+# If the coeff is B, multiply the damage by 10^9, and so on..
+indexB <- economic$PROPDMGEXP=="B"
+indexM <- economic$PROPDMGEXP=="M"
+indexK <- economic$PROPDMGEXP=="K"
+economic$PROPDMG[indexB] <- economic$PROPDMG[indexB] * 1000000000
+economic$PROPDMG[indexM] <- economic$PROPDMG[indexM] * 1000000
+economic$PROPDMG[indexK] <- economic$PROPDMG[indexK] * 1000
+
+# Same thing with crops damages
+indexB <- economic$CROPDMGEXP=="B"
+indexM <- economic$CROPDMGEXP=="M"
+indexK <- economic$cROPDMGEXP=="K"
+economic$CROPDMG[indexB] <- economic$CROPDMG[indexB] * 1000000000
+economic$CROPDMG[indexM] <- economic$CROPDMG[indexM] * 1000000
+economic$CROPDMG[indexK] <- economic$CROPDMG[indexK] * 1000
+
+```
+
+## Results
+
+### Which types of weather events are most harmful with respect to population health?
+
+To identify the types of weather events the most harmful, we can use either the total number of fatalities, injuries or fatalities+injuries linked to each type of event. To evaluate the broad impact of weather events, we use the **total number of fatalities AND injuries** (called here `casualties`). After correctly ordering the dataframe, we can easily get the top 10 most harmful types of weather events :
+
+```{r echo=TRUE, fig.width=9, fig.height=8, message=FALSE}
+# Calculate the total number of casualties
+health <- ddply(health, .(modifiedType), summarise,
+                                casualties = sum(FATALITIES) + sum(INJURIES))
+# Reorder the data to select the top 10
+health <- arrange(health, -casualties)
+# Reorder the label of modifiedType to plot them in decreasing order
+health <- transform(health, modifiedType = reorder(modifiedType, -casualties))
+
+ggplot(health[1:10,], aes(x=modifiedType , y = casualties, fill="red")) +
+        geom_bar(stat="identity") +
+        geom_text(aes(label=casualties), position= position_dodge(width=1), vjust=-0.3, size=3) +
+        labs(title="Top 10 weather event types the most harmful to population health", x="Type of events", y="Number of casualties") +
+        theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Which types of weather events have the greatest economic consequences?
+
+To identify the types of weather events with the geatest economic consequences, we can use either the total damages to properties, crops or properties+crops linked to each type of event. To evaluate the broad impact of weather events, we use the **total number of damages to properties AND crops** (called here `damages`). After correctly ordering the dataframe, we can easily get the top 10 types of weather events with greatest economic consequences :
+
+```{r echo=TRUE, fig.width=9, fig.height=8, message=FALSE}
+# Calculate the total number of casualties
+economic <- ddply(economic, .(modifiedType), summarise,
+                                damages = sum(PROPDMG) + sum(CROPDMG))
+# Reorder the data to select the top 10
+economic <- arrange(economic, -damages)
+# Reorder the label of modifiedType to plot them in decreasing order
+economic <- transform(economic, modifiedType = reorder(modifiedType, -damages))
+
+ggplot(economic[1:10,], aes(x=modifiedType , y = damages, fill="red")) +
+        geom_bar(stat="identity") +
+        geom_text(aes(label=dollar(damages)), position= position_dodge(width=1), hjust=0.1, vjust= -1.3, size=3, angle=45) +
+        labs(title="Top 10 weather event types with geatest economic consequences", x="Type of events", y="Total damages") +
+        theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1)) +
+        scale_y_continuous(limits=c(0, 175000000000),labels=dollar)
+```
+
+## Discussion
+
+There are multiples issues with the analysis provided here. For example : 
+
+* The impacts on **mortality (fatalities) and morbidity (injuries) are treated equally**. Depending on the context for this analysis, we could have analyzed the impact on either mortality OR mordity. We could also "weigth" the mortality/morbidity figures depending on the problem we want to adress. For complex population health impact, additional information are mandatory (i.e. using disability scale to evaluate the level of injuries, etc.). The same gloabl remark could be applied to properties and crops damages in the economic consequences analysis.
+
+* The impact on population health and economic consequences are calculated here **for all the study period (from 1950 to 2011)**. Depending on the problem we want to adress with our analysis, other time period may be considered. To adress possible climate variations and changes, we may have used only the data of the last 5 or 10 years to identify the most actual types of harmful weather events 
+
+* There are numerous ways to clean the `EVTYPE` variable. One could have used some clever regular expression to match existing labels with permitted one. This was tried, but with a very limited succes, hence the manual matching. Regarding the manual matching, it is probably critically flawed as is (*NB : english is not my mother tongue, and I do not work in the weather field !*). **In real settings, a field expert should have been associated to this analysis**, especially for validating the matching.
+
+
